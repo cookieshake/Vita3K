@@ -22,6 +22,7 @@
 #include <mem/ptr.h>
 
 #include <condition_variable>
+#include <mutex>
 #include <queue>
 #include <vector>
 
@@ -52,6 +53,7 @@ struct OperationPending {
             Rack *rack;
             // can't use a ptr, otherwise the default constructor is deleted
             Address callback;
+            Address user_data;
         } release_data;
     };
 };
@@ -72,6 +74,7 @@ protected:
     std::int32_t get_position(Voice *v);
 
 public:
+    bool is_update_thread() const;
     bool deque_voice(Voice *voice);
 
     bool play(const MemState &mem, Voice *voice);
@@ -80,7 +83,7 @@ public:
     bool stop(const MemState &mem, Voice *voice);
     bool off(const MemState &mem, Voice *voice);
 
-    void update(KernelState &kern, const MemState &mem, const SceUID thread_id);
+    void update(KernelState &kern, MemState &mem, const SceUID thread_id);
 
     Ptr<Patch> patch(const MemState &mem, SceNgsPatchSetupInfo *info);
 };

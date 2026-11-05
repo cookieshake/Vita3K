@@ -330,7 +330,7 @@ struct Rack : public MempoolObject {
 
     explicit Rack(System *mama, const Ptr<void> memspace, const uint32_t memspace_size);
 
-    static uint32_t get_required_memspace_size(MemState &mem, SceNgsRackDescription *description);
+    static bool get_required_memspace_size(MemState &mem, const SceNgsRackDescription *description, uint32_t &size);
 };
 
 struct System : public MempoolObject {
@@ -349,9 +349,10 @@ bool deliver_data(const MemState &mem, const std::vector<Voice *> &voice_queue, 
     const VoiceProduct &data_to_deliver);
 
 bool init_system(State &ngs, const MemState &mem, SceNgsSystemInitParams *parameters, Ptr<void> memspace, const uint32_t memspace_size);
-void release_system(State &ngs, const MemState &mem, System *system);
-bool init_rack(State &ngs, const MemState &mem, System *system, SceNgsBufferInfo *init_info, const SceNgsRackDescription *description);
-void release_rack(State &ngs, const MemState &mem, System *system, Rack *rack);
+void release_system(State &ngs, MemState &mem, System *system);
+bool init_rack(State &ngs, MemState &mem, System *system, SceNgsBufferInfo *init_info, const SceNgsRackDescription *description,
+    Ptr<Rack> &rack_handle);
+Ptr<void> release_rack(State &ngs, MemState &mem, System *system, Rack *rack);
 
 void voice_definition_init(State &ngs, MemState &mem);
 Ptr<VoiceDefinition> get_voice_definition(State &ngs, MemState &mem, ngs::BussType type);
