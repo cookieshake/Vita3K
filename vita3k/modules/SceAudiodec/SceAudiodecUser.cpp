@@ -18,6 +18,7 @@
 #include "SceAudiodecUser.h"
 
 #include <audio/state.h>
+#include <codec/aac_output.h>
 #include <codec/state.h>
 #include <kernel/state.h>
 #include <util/lock_and_find.h>
@@ -33,6 +34,8 @@ enum {
     SCE_AUDIODEC_ERROR_INVALID_HANDLE = 0x807F0009,
     SCE_AUDIODEC_ERROR_NOT_HANDLE_IN_USE = 0x807F000A,
     SCE_AUDIODEC_ERROR_INVALID_SIZE = 0x807F000D,
+    SCE_AUDIODEC_ERROR_INVALID_NFRAMES = 0x807F000F,
+    SCE_AUDIODEC_AAC_ERROR_INVALID_CH = 0x807F3000,
     SCE_AUDIODEC_AT9_ERROR_INVALID_CONFIG = 0x807F2000,
     SCE_AUDIODEC_MP3_ERROR_INVALID_MPEG_VERSION = 0x807F2801,
 };
@@ -161,6 +164,14 @@ static int create_decoder(EmuEnvState &emuenv, SceAudiodecCtrl *ctrl, SceAudiode
     const auto state = emuenv.kernel.obj_store.get<AudiodecState>();
     std::lock_guard<std::mutex> lock(state->mutex);
 
+    if (codec == SCE_AUDIODEC_TYPE_AAC) {
+        if (!ctrl->info)
+            return SCE_AUDIODEC_ERROR_INVALID_PTR;
+        const auto &info = ctrl->info.get(emuenv.mem)->aac;
+        if (info.channels < 1 || info.channels > 2)
+            return SCE_AUDIODEC_AAC_ERROR_INVALID_CH;
+    }
+
     SceUID handle = emuenv.kernel.get_next_uid();
     ctrl->handle = handle;
     state->codecs[codec].insert(handle);
@@ -183,7 +194,7 @@ static int create_decoder(EmuEnvState &emuenv, SceAudiodecCtrl *ctrl, SceAudiode
     }
     case SCE_AUDIODEC_TYPE_AAC: {
         SceAudiodecInfoAac &info = ctrl->info.get(emuenv.mem)->aac;
-        DecoderPtr decoder = std::make_shared<AacDecoderState>(info.sample_rate, info.channels);
+        DecoderPtr decoder = std::make_shared<AacDecoderState>(info.sample_rate, info.channels, info.is_sbr != 0);
         state->decoders[handle] = decoder;
 
         ctrl->es_size_max = SCE_AUDIODEC_AAC_MAX_ES_SIZE;
@@ -250,7 +261,36 @@ static int decode_audio_frames(EmuEnvState &emuenv, const char *export_name, Sce
         return SCE_AUDIODEC_ERROR_INVALID_SIZE;
 
     const auto state = emuenv.kernel.obj_store.get<AudiodecState>();
-    const DecoderPtr &decoder = lock_and_find(ctrl->handle, state->decoders, state->mutex);
+    DecoderPtr decoder;
+    bool is_aac = false;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        const auto entry = state->decoders.find(ctrl->handle);
+        if (entry == state->decoders.end())
+            return SCE_AUDIODEC_ERROR_INVALID_HANDLE;
+        decoder = entry->second;
+        const auto aac = state->codecs.find(SCE_AUDIODEC_TYPE_AAC);
+        is_aac = aac != state->codecs.end() && aac->second.contains(ctrl->handle);
+    }
+
+    ctrl->es_size_used = 0;
+    ctrl->pcm_size_given = 0;
+    if (is_aac) {
+        // AAC supports one frame, unlike AT9 (up to eight). Do not interpret
+        // pcm_size_max as an N-frame allocation size or multiply it by nFrames.
+        if (!codec::valid_aac_frame_count(nb_frames))
+            return SCE_AUDIODEC_ERROR_INVALID_NFRAMES;
+        if (!ctrl->es_data || !ctrl->pcm_data)
+            return SCE_AUDIODEC_ERROR_INVALID_PTR;
+        auto &aac = static_cast<AacDecoderState &>(*decoder);
+        DecoderSize size{};
+        if (!aac.send(ctrl->es_data.get(emuenv.mem), ctrl->es_size_max)
+            || !aac.receive_bounded(ctrl->pcm_data.get(emuenv.mem), ctrl->pcm_size_max, &size))
+            return RET_ERROR(SCE_AUDIODEC_ERROR_API_FAIL);
+        ctrl->es_size_used = aac.get_es_size();
+        ctrl->pcm_size_given = size.samples * aac.get(DecoderQuery::CHANNELS) * sizeof(int16_t);
+        return 0;
+    }
 
     uint8_t *es_data = ctrl->es_data.get(emuenv.mem);
     uint8_t *pcm_data = ctrl->pcm_data.get(emuenv.mem);
