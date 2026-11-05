@@ -93,6 +93,7 @@ enum SceNgsErrorCode : uint32_t {
     SCE_NGS_ERROR = 0x804A0001,
     SCE_NGS_ERROR_INVALID_ARG = 0x804A0002,
     SCE_NGS_ERROR_INVALID_STATE = 0x804A0010,
+    SCE_NGS_ERROR_RESOURCE_LOCKED = 0x804A0008,
     SCE_NGS_ERROR_PARAM_OUT_OF_RANGE = 0x804A0009,
     SCE_NGS_ERROR_INVALID_HANDLE = 0x804A000C,
     SCE_NGS_ERROR_PATCH_NOT_AVAIL = 0x804A000E,
@@ -311,7 +312,8 @@ EXPORT(int, sceNgsRackGetRequiredMemorySize, ngs::System *system, SceNgsRackDesc
         || description->max_patches_per_input < 0 || description->patches_per_output < 0) {
         return RET_ERROR(SCE_NGS_ERROR_INVALID_ARG);
     }
-    *size = ngs::Rack::get_required_memspace_size(emuenv.mem, description);
+    if (!ngs::Rack::get_required_memspace_size(emuenv.mem, description, *size))
+        return RET_ERROR(SCE_NGS_ERROR_INVALID_ARG);
     return 0;
 }
 
@@ -342,11 +344,12 @@ EXPORT(SceUInt32, sceNgsRackInit, ngs::System *system, SceNgsBufferInfo *info, c
         return RET_ERROR(SCE_NGS_ERROR_INVALID_ARG);
     }
 
-    if (!ngs::init_rack(emuenv.ngs, emuenv.mem, system, info, description)) {
+    Ptr<ngs::Rack> relocated_rack;
+    if (!ngs::init_rack(emuenv.ngs, emuenv.mem, system, info, description, relocated_rack)) {
         return RET_ERROR(SCE_NGS_ERROR);
     }
 
-    *rack = info->data.cast<ngs::Rack>();
+    *rack = relocated_rack;
     return SCE_NGS_OK;
 }
 
@@ -355,29 +358,56 @@ EXPORT(SceInt32, sceNgsRackRelease, ngs::Rack *rack, Ptr<void> callback) {
     if (!emuenv.cfg.current_config.ngs_enable)
         return SCE_NGS_OK;
 
-    if (!rack)
-        return RET_ERROR(SCE_NGS_ERROR_INVALID_ARG);
-
-    std::unique_lock<std::recursive_mutex> lock(rack->system->voice_scheduler.mutex);
-    if (!rack->system->voice_scheduler.is_updating) {
-        ngs::release_rack(emuenv.ngs, emuenv.mem, rack->system, rack);
+    ngs::System *system = nullptr;
+    {
+        const std::lock_guard<std::mutex> metadata_lock(emuenv.ngs.rack_metadata_mutex);
+        if (!rack || !emuenv.ngs.rack_user_data.contains(rack))
+            return RET_ERROR(SCE_NGS_ERROR_INVALID_HANDLE);
+        system = rack->system;
+    }
+    std::unique_lock<std::recursive_mutex> lock(system->voice_scheduler.mutex);
+    {
+        const std::lock_guard<std::mutex> metadata_lock(emuenv.ngs.rack_metadata_mutex);
+        if (!emuenv.ngs.rack_user_data.contains(rack))
+            return RET_ERROR(SCE_NGS_ERROR_INVALID_HANDLE);
+    }
+    auto pending = system->voice_scheduler.operations_pending;
+    while (!pending.empty()) {
+        if (pending.front().release_data.rack == rack)
+            return RET_ERROR(SCE_NGS_ERROR_INVALID_STATE);
+        pending.pop();
+    }
+    if (!callback && !system->voice_scheduler.is_updating) {
+        const Ptr<void> backing = ngs::release_rack(emuenv.ngs, emuenv.mem, system, rack);
+        if (backing)
+            ::free(emuenv.mem, backing.address());
     } else if (!callback) {
-        // wait for the update to finish
-        // if this is called in an interrupt handler it will softlock ngs
-        // but I don't think this is allowed (and if it is I don't know how to prevent this)
-        LOG_WARN_ONCE("sceNgsRackRelease called in a synchronous way during a ngs update, contact devs if your game softlocks now.");
-
-        rack->system->voice_scheduler.condvar.wait(lock);
-        ngs::release_rack(emuenv.ngs, emuenv.mem, rack->system, rack);
+        // Waiting from our own guest callback deadlocks; other threads can
+        // wait for the update safe point. Preserve System lifetime externally.
+        if (system->voice_scheduler.is_update_thread())
+            return RET_ERROR(SCE_NGS_ERROR_RESOURCE_LOCKED);
+        system->voice_scheduler.condvar.wait(lock, [&] { return !system->voice_scheduler.is_updating; });
+        {
+            const std::lock_guard<std::mutex> metadata_lock(emuenv.ngs.rack_metadata_mutex);
+            if (!emuenv.ngs.rack_user_data.contains(rack))
+                return RET_ERROR(SCE_NGS_ERROR_INVALID_HANDLE);
+        }
+        const Ptr<void> backing = ngs::release_rack(emuenv.ngs, emuenv.mem, system, rack);
+        if (backing)
+            ::free(emuenv.mem, backing.address());
     } else {
-        // destroy rack asynchronously
+        // Only one release may own this rack; snapshot metadata before enqueueing.
         ngs::OperationPending op;
         op.type = ngs::PendingType::ReleaseRack;
-        op.system = rack->system;
+        op.system = system;
         op.release_data.state = &emuenv.ngs;
         op.release_data.rack = rack;
         op.release_data.callback = callback.address();
-        rack->system->voice_scheduler.operations_pending.push(op);
+        {
+            const std::lock_guard<std::mutex> metadata_lock(emuenv.ngs.rack_metadata_mutex);
+            op.release_data.user_data = emuenv.ngs.rack_user_data.at(rack).address();
+        }
+        system->voice_scheduler.operations_pending.push(op);
     }
 
     return SCE_NGS_OK;
@@ -430,11 +460,11 @@ EXPORT(SceInt32, sceNgsSystemRelease, ngs::System *system) {
 
     {
         std::unique_lock<std::recursive_mutex> lock(system->voice_scheduler.mutex);
-        if (system->voice_scheduler.is_updating) {
-            LOG_WARN_ONCE("sceNgsSystemRelease called during a ngs update, contact devs if your game softlocks now.");
-
-            system->voice_scheduler.condvar.wait(lock);
-        }
+        if (system->voice_scheduler.is_update_thread())
+            return RET_ERROR(SCE_NGS_ERROR_RESOURCE_LOCKED);
+        system->voice_scheduler.condvar.wait(lock, [&] { return !system->voice_scheduler.is_updating; });
+        if (!system->voice_scheduler.operations_pending.empty())
+            return RET_ERROR(SCE_NGS_ERROR_RESOURCE_LOCKED);
     }
 
     ngs::release_system(emuenv.ngs, emuenv.mem, system);

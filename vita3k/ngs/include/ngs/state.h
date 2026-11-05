@@ -20,16 +20,23 @@
 #include <mem/ptr.h>
 
 #include <vector>
+#include <unordered_map>
+#include <mutex>
 
 struct MemState;
 
 namespace ngs {
 struct VoiceDefinition;
 struct System;
+struct Rack;
 
 struct State {
     Ptr<VoiceDefinition> definitions;
     std::vector<System *> systems;
+    // Host metadata: do not enlarge guest-resident Rack/Voice objects.
+    std::unordered_map<Rack *, Ptr<void>> rack_user_data;
+    std::unordered_map<Rack *, Ptr<void>> rack_owned_blocks;
+    std::mutex rack_metadata_mutex;
 };
 
 bool init(State &ngs, MemState &mem);

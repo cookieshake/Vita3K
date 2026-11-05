@@ -19,12 +19,32 @@
 #include <ngs/system.h>
 
 #include <kernel/state.h>
+#include <cpu/state.h>
 
 #include <algorithm>
 #include <cstring>
 #include <util/vector_utils.h>
 
 namespace ngs {
+namespace {
+thread_local std::vector<const VoiceScheduler *> active_updates;
+struct UpdateScope {
+    VoiceScheduler &scheduler;
+    explicit UpdateScope(VoiceScheduler &value) : scheduler(value) {
+        active_updates.push_back(&scheduler);
+        scheduler.is_updating = true;
+    }
+    ~UpdateScope() {
+        active_updates.pop_back();
+        scheduler.is_updating = false;
+        scheduler.condvar.notify_all();
+    }
+};
+} // namespace
+
+bool VoiceScheduler::is_update_thread() const {
+    return std::find(active_updates.begin(), active_updates.end(), this) != active_updates.end();
+}
 
 bool VoiceScheduler::deque_voice(Voice *voice) {
     const std::lock_guard<std::recursive_mutex> guard(mutex);
@@ -122,9 +142,11 @@ bool VoiceScheduler::off(const MemState &mem, Voice *voice) {
     return true;
 }
 
-void VoiceScheduler::update(KernelState &kern, const MemState &mem, const SceUID thread_id) {
+void VoiceScheduler::update(KernelState &kern, MemState &mem, const SceUID thread_id) {
     std::unique_lock<std::recursive_mutex> scheduler_lock(mutex);
-    is_updating = true;
+    if (is_updating)
+        return; // A guest callback must not recursively process this snapshot.
+    UpdateScope update_scope(*this);
 
     // make a copy of the queue, this way we have no issue if it is modified in a callback
     std::vector<ngs::Voice *> queue_copy = queue;
@@ -174,21 +196,31 @@ void VoiceScheduler::update(KernelState &kern, const MemState &mem, const SceUID
     }
 
     while (!operations_pending.empty()) {
-        OperationPending &op = operations_pending.front();
+        // Guest callbacks can append more work. Never retain a reference into
+        // the queue across one, and remove this operation before dispatch.
+        const OperationPending op = operations_pending.front();
+        operations_pending.pop();
 
         switch (op.type) {
         case PendingType::ReleaseRack:
-            release_rack(*op.release_data.state, mem, op.system, op.release_data.rack);
-            // run callback (we know it is defined)
-            kern.get_thread(thread_id)->run_callback(op.release_data.callback, { Ptr<void>(op.release_data.rack, mem).address() });
+            // Snapshot handles before destruction; callbacks receive a pointer
+            // to SceNgsCallbackInfo, not the destroyed Rack as their argument.
+            {
+                SceNgsCallbackInfo info{};
+                info.rack_handle = Ptr<void>(op.release_data.rack, mem);
+                info.userdata = Ptr<void>(op.release_data.user_data);
+                const Ptr<void> owned_backing = release_rack(*op.release_data.state, mem, op.system, op.release_data.rack);
+                const auto thread = kern.get_thread(thread_id);
+                const Address info_address = thread->cpu->stack_alloc(sizeof(info));
+                *Ptr<SceNgsCallbackInfo>(info_address).get(mem) = info;
+                thread->run_callback(op.release_data.callback, { info_address });
+                thread->cpu->stack_free(sizeof(info));
+                if (owned_backing)
+                    ::free(mem, owned_backing.address());
+            }
             break;
         }
-
-        operations_pending.pop();
     }
-
-    is_updating = false;
-    condvar.notify_all();
 }
 
 int32_t VoiceScheduler::get_position(Voice *v) {
@@ -241,6 +273,11 @@ Ptr<Patch> VoiceScheduler::patch(const MemState &mem, SceNgsPatchSetupInfo *info
     // First, check if these two voices are scheduled yet
     Voice *source = info->source.get(mem);
     Voice *dest = info->dest.get(mem);
+    // Rack teardown scans its owning system for incoming routes. Enforce the
+    // SDK's same-system invariant before creating any source-owned patch.
+    if (!source || !dest || source->rack->system != dest->rack->system
+        || &source->rack->system->voice_scheduler != this)
+        return {};
 
     Ptr<Patch> patch = source->patch(mem, info->source_output_index, info->source_output_subindex, info->dest_input_index, info->source, info->dest);
 

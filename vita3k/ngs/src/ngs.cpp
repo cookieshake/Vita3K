@@ -25,6 +25,8 @@
 
 #include <util/vector_utils.h>
 
+#include <limits>
+
 namespace ngs {
 Rack::Rack(System *mama, const Ptr<void> memspace, const uint32_t memspace_size)
     : MempoolObject(memspace, memspace_size)
@@ -342,13 +344,50 @@ uint32_t System::get_required_memspace_size(SceNgsSystemInitParams *parameters) 
     return sizeof(System);
 }
 
-uint32_t Rack::get_required_memspace_size(MemState &mem, SceNgsRackDescription *description) {
-    uint32_t buffer_size = 0;
-    if (description->definition)
-        // multiply by 2 because there are 2 copies of each buffer
-        buffer_size = 2 * get_voice_definition_size(description->definition.get(mem));
+bool Rack::get_required_memspace_size(MemState &mem, const SceNgsRackDescription *description, uint32_t &size) {
+    if (!description || !description->definition || description->voice_count <= 0 || description->channels_per_voice < 0
+        || description->channels_per_voice > 2 || description->max_patches_per_input < 0 || description->patches_per_output < 0)
+        return false;
 
-    return sizeof(ngs::Rack) + description->voice_count * (sizeof(ngs::Voice) + buffer_size + description->patches_per_output * description->definition.get(mem)->output_count * sizeof(ngs::Patch));
+    VoiceDefinition *definition = description->definition.get(mem);
+    if (!definition || definition->output_count == 0 || definition->type >= BussType::BUSS_MAX)
+        return false;
+
+    // Report host layout size with checked arithmetic for untrusted counts.
+    constexpr uint64_t max_size = std::numeric_limits<uint64_t>::max();
+    std::vector<std::unique_ptr<Module>> modules;
+    try {
+        apply_voice_definition(definition, modules);
+    } catch (...) {
+        return false;
+    }
+    uint64_t parameters_per_voice = 0;
+    for (const auto &module : modules) {
+        const uint64_t parameter_size = module->get_buffer_parameter_size();
+        const uint64_t aligned_parameter_size = (parameter_size + 3u) & ~uint64_t(3u);
+        if (aligned_parameter_size > (max_size - parameters_per_voice) / 2)
+            return false;
+        parameters_per_voice += 2 * aligned_parameter_size;
+    }
+    uint64_t patches_per_voice = static_cast<uint32_t>(description->patches_per_output);
+    if (definition->output_count && patches_per_voice > max_size / definition->output_count)
+        return false;
+    patches_per_voice *= definition->output_count;
+    if (sizeof(Patch) && patches_per_voice > max_size / sizeof(Patch))
+        return false;
+    patches_per_voice *= sizeof(Patch);
+    if (parameters_per_voice > max_size - sizeof(Voice)
+        || patches_per_voice > max_size - sizeof(Voice) - parameters_per_voice)
+        return false;
+    const uint64_t per_voice = sizeof(Voice) + parameters_per_voice + patches_per_voice;
+    if (per_voice && static_cast<uint64_t>(description->voice_count) > (max_size - sizeof(Rack)) / per_voice)
+        return false;
+    const uint64_t total = sizeof(Rack) + static_cast<uint64_t>(description->voice_count) * per_voice;
+    if (total > std::numeric_limits<uint32_t>::max())
+        return false;
+
+    size = static_cast<uint32_t>(total);
+    return true;
 }
 
 bool init(State &ngs, MemState &mem) {
@@ -387,16 +426,17 @@ bool init_system(State &ngs, const MemState &mem, SceNgsSystemInitParams *parame
     return true;
 }
 
-void release_system(State &ngs, const MemState &mem, System *system) {
-    // this function assumes no ngs mutex is being held
-    for (Rack *rack : system->racks) {
-        if (!rack)
-            continue;
-        for (const auto &voice : rack->voices) {
-            system->voice_scheduler.deque_voice(voice.get(mem));
-            voice.get(mem)->~Voice();
-        }
-        rack->~Rack();
+void release_system(State &ngs, MemState &mem, System *system) {
+    // System shutdown uses the same route detachment and module cleanup as
+    // individual rack release. Caller guarantees no update/callback is active.
+    while (true) {
+        const auto rack = std::find_if(system->racks.begin(), system->racks.end(),
+            [](Rack *entry) { return entry != nullptr; });
+        if (rack == system->racks.end())
+            break;
+        const Ptr<void> backing = release_rack(ngs, mem, system, *rack);
+        if (backing)
+            ::free(mem, backing.address());
     }
 
     system->racks.clear();
@@ -405,82 +445,138 @@ void release_system(State &ngs, const MemState &mem, System *system) {
     system->~System();
 }
 
-bool init_rack(State &ngs, const MemState &mem, System *system, SceNgsBufferInfo *init_info, const SceNgsRackDescription *description) {
-    Rack *rack = init_info->data.cast<Rack>().get(mem);
-    rack = new (rack) Rack(system, init_info->data, init_info->size);
-
-    // Alloc first block for Rack
-    if (!rack->alloc<Rack>()) {
+bool init_rack(State &ngs, MemState &mem, System *system, SceNgsBufferInfo *init_info, const SceNgsRackDescription *description,
+    Ptr<Rack> &rack_handle) {
+    uint32_t required_size = 0;
+    if (!system || !init_info || !init_info->data || !init_info->size
+        || !Rack::get_required_memspace_size(mem, description, required_size)
+        || init_info->size < required_size
+        // mem::alloc rounds to a 4 KiB page; keep its alignment addition in range.
+        || required_size > std::numeric_limits<uint32_t>::max() - 4095u) {
         return false;
     }
 
-    if (description->definition)
-        apply_voice_definition(description->definition.get(mem), rack->modules);
-    else
-        rack->modules.clear();
+    const Address backing_address = ::alloc(mem, required_size, "NGS Rack backing");
+    if (!backing_address)
+        return false;
+    const Ptr<void> backing(backing_address);
+    Rack *rack = nullptr;
+    bool rack_constructed = false;
+    size_t completed_voices = 0;
+    size_t initialized_modules = 0;
+    Voice *partial_voice = nullptr;
 
-    // Initialize voice definition
-    rack->channels_per_voice = description->channels_per_voice;
-    rack->max_patches_per_input = description->max_patches_per_input;
-    rack->patches_per_output = description->patches_per_output;
+    auto rollback = [&] {
+        if (rack_constructed) {
+            for (size_t voice_index = 0; voice_index < completed_voices; ++voice_index) {
+                Voice *voice = rack->voices[voice_index].get(mem);
+                for (size_t module_index = 0; module_index < rack->modules.size(); ++module_index) {
+                    if (rack->modules[module_index])
+                        rack->modules[module_index]->cleanup_voice_state(voice->datas[module_index]);
+                }
+                voice->~Voice();
+            }
+            if (partial_voice) {
+                for (size_t module_index = 0; module_index < initialized_modules; ++module_index) {
+                    if (rack->modules[module_index])
+                        rack->modules[module_index]->cleanup_voice_state(partial_voice->datas[module_index]);
+                }
+                partial_voice->~Voice();
+            }
+            rack->~Rack();
+        }
+        ::free(mem, backing.address());
+    };
 
-    // Alloc spaces for voice
-    rack->voices.resize(description->voice_count);
-    rack->vdef = description->definition.get(mem);
-
-    for (auto &voice : rack->voices) {
-        voice = rack->alloc<Voice>();
-
-        if (!voice) {
+    try {
+        rack = new (backing.cast<Rack>().get(mem)) Rack(system, backing, required_size);
+        rack_constructed = true;
+        if (!rack->alloc<Rack>()) {
+            rollback();
             return false;
         }
 
-        Voice *v = voice.get(mem);
-        new (v) Voice();
-        v->init(rack);
+        apply_voice_definition(description->definition.get(mem), rack->modules);
+        rack->channels_per_voice = description->channels_per_voice;
+        rack->max_patches_per_input = description->max_patches_per_input;
+        rack->patches_per_output = description->patches_per_output;
+        rack->voices.resize(description->voice_count);
+        rack->vdef = description->definition.get(mem);
 
-        // Allocate parameter buffer info for each voice
-        for (size_t i = 0; i < rack->modules.size(); i++) {
-            v->datas[i].info.size = rack->modules[i]->get_buffer_parameter_size();
-            v->datas[i].info.data = rack->alloc_raw(v->datas[i].info.size);
-            // from the behavior of games, it looks like the other info buffer (there are two copies because of VoiceLock) is located right after the first
-            // one, so copy this behavior, to avoid a game overwriting some important ngs struct
-            rack->alloc_raw(v->datas[i].info.size);
+        for (auto &voice_handle : rack->voices) {
+            voice_handle = rack->alloc<Voice>();
+            if (!voice_handle) {
+                rollback();
+                return false;
+            }
 
-            v->datas[i].parent = v;
-            v->datas[i].index = static_cast<uint32_t>(i);
-            rack->modules[i]->initialize_voice_data(v->datas[i]);
+            partial_voice = voice_handle.get(mem);
+            new (partial_voice) Voice();
+            partial_voice->init(rack);
+            initialized_modules = 0;
+            for (size_t module_index = 0; module_index < rack->modules.size(); ++module_index) {
+                ModuleData &data = partial_voice->datas[module_index];
+                data.info.size = rack->modules[module_index]->get_buffer_parameter_size();
+                data.info.data.reset();
+                // Zero-byte interfaces need initialization, but no pool storage.
+                // alloc_raw(0) can fail after the last Voice exactly fills the pool.
+                if (data.info.size != 0) {
+                    data.info.data = rack->alloc_raw(data.info.size);
+                    // Keep the second VoiceLock parameter copy inside the owned block.
+                    const Ptr<void> second_copy = rack->alloc_raw(data.info.size);
+                    if (!data.info.data || !second_copy) {
+                        rollback();
+                        return false;
+                    }
+                }
+                data.parent = partial_voice;
+                data.index = static_cast<uint32_t>(module_index);
+                ++initialized_modules;
+                rack->modules[module_index]->initialize_voice_data(data);
+            }
+            ++completed_voices;
+            partial_voice = nullptr;
+            initialized_modules = 0;
         }
-    }
 
-    system->racks.push_back(rack);
-
-    return true;
-}
-
-void release_rack(State &ngs, const MemState &mem, System *system, Rack *rack) {
-    // this function should only be called outside of ngs update and with the scheduler mutex acquired (except when releasing the system)
-    if (!rack)
-        return;
-
-    // remove all queued voices
-    for (const auto &voice : rack->voices) {
-        Voice *v = voice.get(mem);
-        system->voice_scheduler.deque_voice(voice.get(mem));
-        // clean up host resources per voice before destroying
-        for (size_t i = 0; i < rack->modules.size() && i < v->datas.size(); i++) {
-            if (rack->modules[i])
-                rack->modules[i]->cleanup_voice_state(v->datas[i]);
+        system->racks.push_back(rack);
+        bool metadata_committed = false;
+        try {
+            {
+                const std::lock_guard<std::mutex> lock(ngs.rack_metadata_mutex);
+                const auto [owned_it, owned_inserted] = ngs.rack_owned_blocks.emplace(rack, backing);
+                if (owned_inserted) {
+                    try {
+                        const auto [user_it, user_inserted] = ngs.rack_user_data.emplace(rack, description->unk14);
+                        (void)user_it;
+                        if (user_inserted) {
+                            metadata_committed = true;
+                        } else {
+                            ngs.rack_owned_blocks.erase(owned_it);
+                        }
+                    } catch (...) {
+                        ngs.rack_owned_blocks.erase(owned_it);
+                        throw;
+                    }
+                }
+            }
+        } catch (...) {
+            system->racks.pop_back();
+            rollback();
+            return false;
         }
-        // no need to free the voice from the rack
-        v->~Voice();
+        if (!metadata_committed) {
+            system->racks.pop_back();
+            rollback();
+            return false;
+        }
+
+        rack_handle = Ptr<Rack>(rack, mem);
+        return true;
+    } catch (...) {
+        rollback();
+        return false;
     }
-
-    // remove from system
-    vector_utils::erase_first(system->racks, rack);
-
-    // free pointer memory
-    rack->~Rack();
 }
 
 Ptr<VoiceDefinition> get_voice_definition(State &ngs, MemState &mem, ngs::BussType type) {
