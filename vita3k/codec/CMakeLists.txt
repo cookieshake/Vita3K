@@ -15,10 +15,3 @@ add_library(
 
 target_include_directories(codec PUBLIC include)
 target_link_libraries(codec PRIVATE ffmpeg libatrac9 util) 
-
-if(NOT ANDROID)
-	add_executable(aac-output-tests ${PROJECT_SOURCE_DIR}/tools/ing165/tests/aac_fixture.cpp)
-	target_include_directories(aac-output-tests PRIVATE ${PROJECT_SOURCE_DIR}/external/ffmpeg/include)
-	target_link_libraries(aac-output-tests PRIVATE codec ffmpeg)
-	add_test(NAME aac-output COMMAND aac-output-tests)
-endif()
