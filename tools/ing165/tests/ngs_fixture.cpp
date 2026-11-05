@@ -217,6 +217,7 @@ int main() {
         phase = "allocation and initialization rollback";
         auto sys5 = system(mem, state);
         auto def = mem.make<ngs::VoiceDefinition>();
+        def->type = ngs::BussType::BUSS_SIMPLE;
         def->output_count = 2;
         SceNgsRackDescription description{};
         description.definition = Ptr<ngs::VoiceDefinition>(def, mem);
@@ -244,7 +245,8 @@ int main() {
         const auto before_definition = mem.free_count;
         check(!ngs::init_rack(state, mem, sys5, &info, &description, output), "definition failure rejected");
         throw_on_definition_call = 0;
-        check(mem.free_count == before_definition + 1 && sys5->racks.empty(), "definition failure rolls back backing");
+        check(mem.free_count == before_definition + 1, "definition failure frees backing");
+        check(sys5->racks.empty(), "definition failure leaves no rack");
 
         phase = "parameter stage rollback";
         configured_module_count = 2;
@@ -311,6 +313,7 @@ int main() {
         ngs::release_system(state, mem, sys7);
         std::puts("NGS fixture PASS: relocation handle/canary, alignment/zero-size, overflow, rollback, async callback lifetime, System shutdown, churn, routes");
         check(run_ngs_review_fixture() == 0, "real-module rollback and poisoned reuse fixture");
+        return 0;
     } catch (const std::exception &error) {
         std::fprintf(stderr, "FAIL at %s: %s\n", phase, error.what());
         return 1;
@@ -457,4 +460,5 @@ int run_ngs_review_fixture() {
         std::fprintf(stderr, "FAIL: %s\n", e.what());
         return 1;
     }
+    return 0;
 }

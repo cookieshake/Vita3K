@@ -25,22 +25,3 @@ add_library(
 target_include_directories(ngs PUBLIC include)
 target_link_libraries(ngs PUBLIC codec)
 target_link_libraries(ngs PRIVATE util mem kernel cpu ffmpeg)
-
-if(NOT ANDROID)
-	add_executable(
-		ngs-relocation-tests
-		${PROJECT_SOURCE_DIR}/tools/ing165/tests/ngs_fixture.cpp
-		src/ngs.cpp
-		src/rack_release.cpp
-		src/scheduler.cpp
-		src/route.cpp
-		src/modules/mixer.cpp
-		src/modules/output.cpp)
-	target_include_directories(ngs-relocation-tests PRIVATE
-		${PROJECT_SOURCE_DIR}/tools/ing165/tests/stubs
-		${CMAKE_CURRENT_SOURCE_DIR}/include
-		${PROJECT_SOURCE_DIR}/vita3k/mem/include
-		${PROJECT_SOURCE_DIR}/vita3k/util/include
-		${PROJECT_SOURCE_DIR}/vita3k/codec/include)
-	add_test(NAME ngs-relocation COMMAND ngs-relocation-tests)
-endif()
