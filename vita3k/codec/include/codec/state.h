@@ -21,6 +21,7 @@
 #include <mutex>
 #include <queue>
 #include <string>
+#include <vector>
 
 struct AVFrame;
 struct AVPacket;
@@ -229,17 +230,28 @@ public:
 };
 
 struct AacDecoderState : public DecoderState {
-    const AVCodec *codec;
+    const AVCodec *codec = nullptr;
     SwrContext *swr = nullptr;
-    AVFrame *frame;
-    uint32_t es_size_used;
+    AVFrame *frame = nullptr;
+    AVFrame *resampler_format = nullptr;
+    uint32_t es_size_used = 0;
+    uint32_t output_sample_rate;
+    uint32_t output_channels;
+    bool is_sbr;
+    bool has_frame = false;
+    bool output_ready = false;
+    std::vector<uint8_t> output_pcm;
+
+    bool prepare_output();
     uint32_t get(DecoderQuery query) override;
 
     bool send(const uint8_t *data, uint32_t size) override;
     bool receive(uint8_t *data, DecoderSize *size) override;
+    bool receive_bounded(uint8_t *data, uint32_t capacity, DecoderSize *size);
     uint32_t get_es_size() override;
+    void flush() override;
 
-    explicit AacDecoderState(uint32_t sample_rate, uint32_t channels);
+    explicit AacDecoderState(uint32_t sample_rate, uint32_t channels, bool sbr = false);
     ~AacDecoderState() override;
 };
 
