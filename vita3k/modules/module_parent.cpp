@@ -148,7 +148,7 @@ static void log_import_call(char emulation_level, uint32_t nid, SceUID thread_id
     }
 }
 
-void call_import(EmuEnvState &emuenv, CPUState &cpu, uint32_t nid, SceUID thread_id) {
+CallResult call_import(EmuEnvState &emuenv, CPUState &cpu, uint32_t nid, SceUID thread_id) {
     // HLE - call our C++ function
     if (emuenv.kernel.debugger.watch_import_calls) {
         const std::unordered_set<uint32_t> hle_nid_blacklist = {
@@ -160,19 +160,17 @@ void call_import(EmuEnvState &emuenv, CPUState &cpu, uint32_t nid, SceUID thread
         log_import_call('H', nid, thread_id, hle_nid_blacklist, lr);
     }
     const ImportFn *fn = resolve_import(nid);
-    if (fn) {
-        (*fn)(emuenv, cpu, thread_id);
-    } else {
-        const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
-        // make the function return 0
-        thread->cpu->set_reg(0, 0);
+    if (fn)
+        return (*fn)(emuenv, cpu, thread_id);
 
-        if (!emuenv.missing_nids.contains(nid) || LOG_UNK_NIDS_ALWAYS) {
-            LOG_ERROR("Import function for NID {} not found (thread name: {}, thread ID: {})", log_hex(nid), thread->name, thread_id);
-            if (!LOG_UNK_NIDS_ALWAYS)
-                emuenv.missing_nids.insert(nid);
-        }
+    if (!emuenv.missing_nids.contains(nid) || LOG_UNK_NIDS_ALWAYS) {
+        const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+        LOG_ERROR("Import function for NID {} not found (thread name: {}, thread ID: {})", log_hex(nid), thread->name, thread_id);
+        if (!LOG_UNK_NIDS_ALWAYS)
+            emuenv.missing_nids.insert(nid);
     }
+    // A missing function returns 0
+    return { .regs = { 0 }, .count = 1 };
 }
 
 struct SceKernelBootimageModules {
@@ -335,7 +333,7 @@ uint32_t start_module(EmuEnvState &emuenv, const SceKernelModuleInfo &module, Sc
         // module_start is always called from new thread
         const ThreadStatePtr module_thread = emuenv.kernel.create_thread(emuenv.mem, module_name, module_start, priority, affinity, stack_size, 0);
 
-        const uint32_t ret = module_thread->run_guest_function(args, argp.cast<void>());
+        const uint32_t ret = module_thread->start_and_wait(args, argp.cast<void>());
         module_thread->remove();
 
         LOG_INFO("Module {} (at \"{}\") module_start returned {}", module_name, module.path, log_hex(ret));
@@ -359,7 +357,7 @@ uint32_t stop_module(EmuEnvState &emuenv, const SceKernelModuleInfo &module, Sce
         // module_stop is always called from new thread
         const ThreadStatePtr module_thread = emuenv.kernel.create_thread(emuenv.mem, module_name, module_stop, priority, affinity, stack_size, 0);
 
-        const uint32_t ret = module_thread->run_guest_function(args, argp.cast<void>());
+        const uint32_t ret = module_thread->start_and_wait(args, argp.cast<void>());
         module_thread->remove();
 
         LOG_INFO("Module {} (at \"{}\") module_stop returned {}", module_name, module.path, log_hex(ret));

@@ -38,32 +38,21 @@ struct KernelState;
 class Callback;
 using CallbackPtr = std::shared_ptr<Callback>;
 
-// The attribute of every user thread, which thread info always reports
-constexpr SceUInt32 THREAD_ATTR_USER = 0x80000000U;
-// Attributes a thread may be created with, which the Vita Development Wiki calls
-// SCE_KERNEL_THREAD_ATTR_NOUSE_VFP and SCE_KERNEL_THREAD_ATTR_VM
-constexpr SceUInt32 THREAD_ATTR_NOUSE_VFP = 0x01000000U;
-constexpr SceUInt32 THREAD_ATTR_VM = 0x04000000U;
-// Another attribute a Vita accepts for a thread, with no known name or effect
-constexpr SceUInt32 THREAD_ATTR_UNKNOWN_2000 = 0x00002000U;
-// The FPSCR a thread starts with: round to nearest, flush-to-zero and default NaN
-constexpr uint32_t INITIAL_FPSCR = 0x03000000U;
-
 // Values are what sceKernelGetThreadInfo reports
 enum class ThreadStatus : SceUInt32 {
     running = SCE_KERNEL_THREAD_STATUS_RUNNING,
     waiting = SCE_KERNEL_THREAD_STATUS_WAITING, // Waiting to be awaken by sync object or operation
     dormant = SCE_KERNEL_THREAD_STATUS_DORMANT, // Waiting for a job
     deleted = SCE_KERNEL_THREAD_STATUS_DELETED, // Gone for guest calls, until its host thread ends
-    suspended = SCE_KERNEL_THREAD_STATUS_SUSPENDED, // Suspended by debugger
+    suspended = SCE_KERNEL_THREAD_STATUS_SUSPENDED, // Held by a ForVM suspend, only reported
 };
 
-struct ThreadState final : private GuestBoundary {
+struct ThreadState final {
     // Fixed when the thread is created
     const SceUID id;
     const std::string name;
     const Address entry_point;
-    // What thread info reports, the creation attributes and THREAD_ATTR_USER
+    // What thread info reports, the creation attributes and SCE_KERNEL_THREAD_ATTR_USER
     const SceUInt32 attr;
     // The stack size, a whole number of pages
     const int stack_size;
@@ -96,10 +85,10 @@ struct ThreadState final : private GuestBoundary {
     // Calls a guest function on the thread's CPU from inside a kernel call, usually one the thread
     // itself made, and returns its r0, or the exit status if the thread ends during it. With
     // fresh_vfp_state, the call starts with the FPSCR and VFP exception setting of a new thread.
-    uint32_t run_callback(Address callback_address, std::initializer_list<uint32_t> args, bool fresh_vfp_state = false);
+    uint32_t call_guest(Address fn, std::initializer_list<uint32_t> args, bool fresh_vfp_state = false);
     // Starts the dormant thread from another thread and returns its exit status once it ends. Used
     // for module start and stop and the GXM display queue.
-    uint32_t run_guest_function(SceSize args, const Ptr<void> argp = Ptr<void>{});
+    uint32_t start_and_wait(SceSize args, const Ptr<void> argp = Ptr<void>{});
 
     // Status and info
     ThreadStatus get_status() const;
@@ -120,27 +109,29 @@ struct ThreadState final : private GuestBoundary {
 
     // Waits
     // Blocks this thread until the deadline passes.
-    [[nodiscard]] WaitResult delay_until(Deadline deadline, bool callbacks);
+    [[nodiscard]] SceInt32 delay_until(Deadline deadline, bool callbacks);
     // Blocks this thread until a signal is sent to it or the timeout passes, writing the time left back.
-    [[nodiscard]] WaitResult wait_for_signal(SceUInt32 *timeout, bool callbacks);
+    [[nodiscard]] SceInt32 wait_for_signal(SceUInt32 *timeout, bool callbacks);
     // Sends a signal to this thread. Fails if the previous one was not consumed yet.
     SceInt32 send_signal();
     // Blocks waiter until this thread becomes dormant, then writes its exit status to exit_status.
-    [[nodiscard]] WaitResult wait_for_thread_end(const ThreadStatePtr &waiter, SceInt32 *exit_status, Deadline deadline, bool callbacks);
-    // Waits on target until woken by wake(), the thread exits or is deleted, or the deadline passes.
+    [[nodiscard]] SceInt32 wait_for_thread_end(const ThreadStatePtr &waiter, SceInt32 *exit_status, Deadline deadline, bool callbacks);
+    // Waits on target until woken by wake(), the deadline passes, or the thread exits or is deleted,
+    // which ends it with THREAD_STOPPED.
     // With target.callbacks, a notified callback ends it with NOTIFY_CALLBACK, and the caller runs
     // it with run_callbacks(). A stale wake can end it early, so callers must recheck their condition.
-    [[nodiscard]] WaitResult wait(WaitTarget target, Deadline deadline);
+    [[nodiscard]] SceInt32 wait(WaitTarget target, Deadline deadline);
     // Runs the notified callbacks for a wait that ended with NOTIFY_CALLBACK, with no lock held.
-    // Returns ThreadExiting if the thread exits or is deleted meanwhile.
-    [[nodiscard]] WaitResult run_callbacks();
+    // Returns THREAD_STOPPED if the thread exits or is deleted meanwhile.
+    [[nodiscard]] SceInt32 run_callbacks();
     // Wakes this thread from wait().
     void wake();
-    // Shows the thread WAITING while it lives, for a host call that blocks the thread, like an audio
-    // output, and RUNNING after
+    // A host call that blocks the thread inside an export, like an audio output, during which the
+    // thread counts as stopped. It shows WAITING on shown while it lives, or stays RUNNING without
+    // a target.
     class HostWait {
     public:
-        explicit HostWait(ThreadState &thread);
+        explicit HostWait(ThreadState &thread, std::optional<WaitTarget> shown = WaitTarget{});
         ~HostWait();
         HostWait(const HostWait &) = delete;
         HostWait &operator=(const HostWait &) = delete;
@@ -173,10 +164,14 @@ struct ThreadState final : private GuestBoundary {
     bool step();
     // Waits until the thread doesn't run guest code
     void wait_until_not_running();
-    // Whether the debugger's hold stopped the thread at a breakpoint
+    // Whether the debugger holds the thread and it has stopped. Once the debugger has let every
+    // thread go, only a breakpoint or a finished step holds a thread for it again.
     bool stopped_at_breakpoint() const;
-    // Stops the thread while the emulator is paused, or lets it run again
-    void set_paused(bool paused);
+    // Stops the thread's guest code for the emulator pause KernelState just set, or lets the thread
+    // run again after it
+    void pause_changed();
+
+    // ForVM suspend
     // Suspends the thread for sceKernelSuspendThreadForVM: it doesn't run guest code until as many
     // vm_resume calls. vm_suspend returns once it has stopped. Each returns the suspend count after
     // it, or an error for a dormant thread or a resume with no suspend.
@@ -199,16 +194,6 @@ private:
         remove,
     };
 
-    // What keeps the thread from running guest code. It runs only while nothing holds it.
-    struct Holds {
-        // The emulator is paused
-        bool pause = false;
-        // The debugger stopped it, or it hit a breakpoint or finished a step
-        bool debugger = false;
-        // The sceKernelSuspendThreadForVM calls no sceKernelResumeThreadForVM undid yet
-        int vm = 0;
-    };
-
     struct EndWaitEntry {
         // Where to write the exit status, or null
         SceInt32 *exit_status;
@@ -216,10 +201,22 @@ private:
 
     // The private methods are called with mutex held, unless they say otherwise
     void update_status(ThreadStatus status);
+    // The status the guest sees: SUSPENDED for a thread a ForVM suspend holds at its stop
+    ThreadStatus shown_status() const;
     // Whether the thread is ending
     bool exiting() const { return ending != Ending::none; }
+    // Sets how the thread ends, which stops its guest code for good and drops a step it didn't take
+    // unless it's none
+    void set_ending(Ending how);
+    // Whether something holds the thread before its guest code: the debugger, the emulator pause or
+    // a ForVM suspend
+    bool held() const;
+    // Waits with mutex held through lock until nothing holds the thread, parked meanwhile
+    void stop_for_holds(std::unique_lock<std::mutex> &lock);
+    // Whether the thread may run guest code now, or kernel code that changes its registers
+    bool runs() const { return status == ThreadStatus::running && !parked && !host_waiting; }
     // Asks the thread to end, keeping a stronger request already made
-    void request_ending(Ending how) { ending = std::max(ending, how); }
+    void request_ending(Ending how) { set_ending(std::max(ending, how)); }
     // Whether a callback of this thread was notified and hasn't run yet
     bool callbacks_notified() const { return notified_callbacks > 0; }
     // Whether a notified callback ends the current wait. Callbacks don't nest, so a wait inside a
@@ -229,28 +226,28 @@ private:
     // the thread hasn't gone on yet. With mutex held.
     bool wait_over() const { return exiting() || wake_pending || callback_ends_wait(); }
 
-    // Runs guest code at one level, the thread's run or a call, with mutex held through lock. A call
-    // the kernel makes starts from_kernel_call. Returns r0 once the level's function returns, or
-    // nothing once the thread is ending.
+    // Runs guest code at one level, the thread's run or a call, with mutex held through lock, which
+    // it releases around guest code and the handling of each exit. A call the kernel makes starts
+    // from_kernel_call. Returns r0 once the level's function returns, or nothing once the
+    // thread is ending.
     std::optional<uint32_t> run_guest(std::unique_lock<std::mutex> &lock, bool from_kernel_call);
     // Ends the thread's run and returns whether it parks dormant for another start
     bool finish_run(std::unique_lock<std::mutex> &lock);
-    // The hold gate, checked before guest code starts and at each stop. It may block. Takes mutex.
-    GuestResume checkpoint(GuestStop stop) override;
-    // Runs an import the thread's guest code called, without mutex held
-    void call_import(uint32_t nid) override;
     // Calls the guest's data abort handler with the abort context on the stack, without mutex held
-    void dispatch_abort(Address fault_addr) override;
+    void dispatch_abort(Address fault_addr);
 
     // Fixed when the thread is created
     KernelState &kernel;
     MemState &mem;
 
     mutable std::mutex mutex;
+    // The one condition variable. The thread's waits, its dormant park and its holds wait on it,
+    // and so do other threads that wait for its status. Every change any of them reads notifies all.
+    std::condition_variable cv;
 
     // The rest is guarded by mutex, unless it says otherwise
 
-    // Lifecycle
+    // Lifecycle. RUNNING, WAITING, DORMANT or DELETED, SUSPENDED is only reported.
     ThreadStatus status = ThreadStatus::dormant;
     // The exit status the guest sees: DORMANT until the first start, NOT_DORMANT while the thread
     // runs, then what it returned or exited with
@@ -258,9 +255,6 @@ private:
     Ending ending = Ending::none;
     // Run the thread start event once before guest code. Set by start().
     bool run_start_callback = false;
-    // The one condition variable. The thread's waits, its dormant park and its hold gate wait on it,
-    // and so do other threads that wait for its status. Every change any of them reads notifies all.
-    std::condition_variable cv;
 
     // Priority and affinity
     int priority;
@@ -285,13 +279,22 @@ private:
     // touches the list.
     std::list<std::weak_ptr<Callback>> callbacks;
 
-    // Holds
-    Holds holds;
-    // The debugger asked for one instruction, after which the thread holds again
-    bool step_requested = false;
-    // Whether the gate's last check of the thread's guest code came right after a kernel call,
-    // which a hold there reports. Only checkpoint() writes it.
+    // ForVM suspend
+    // The sceKernelSuspendThreadForVM calls no sceKernelResumeThreadForVM undid yet
+    int vm_suspend_count = 0;
+    // Whether the guest code of the level about to run last stopped right after a kernel call, which
+    // a hold there reports. run_guest() sets it before the holds.
     bool stopped_after_kernel_call = false;
+
+    // The host's control, which the guest never sees
+    // The debugger holds the thread, also after a breakpoint or a finished step
+    bool debugger_hold = false;
+    // The debugger asked for one instruction, which the next run of guest code takes
+    bool step_requested = false;
+    // The thread waits for its holds before guest code, with its registers still
+    bool parked = false;
+    // Blocked in a host wait inside an export
+    bool host_waiting = false;
 
     // Threads blocked in sceKernelWaitThreadEnd on this one, with their own lock, taken after mutex
     std::mutex end_waiters_mutex;

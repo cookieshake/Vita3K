@@ -213,7 +213,7 @@ void VoiceScheduler::update(KernelState &kern, MemState &mem, const SceUID threa
                 const auto thread = kern.get_thread(thread_id);
                 const Address info_address = thread->cpu->stack_alloc(sizeof(info));
                 *Ptr<SceNgsCallbackInfo>(info_address).get(mem) = info;
-                thread->run_callback(op.release_data.callback, { info_address });
+                thread->call_guest(op.release_data.callback, { info_address });
                 thread->cpu->stack_free(sizeof(info));
                 if (owned_backing)
                     ::free(mem, owned_backing.address());

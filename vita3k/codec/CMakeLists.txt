@@ -14,4 +14,8 @@ add_library(
 )
 
 target_include_directories(codec PUBLIC include)
-target_link_libraries(codec PRIVATE ffmpeg libatrac9 util) 
+target_link_libraries(codec PRIVATE ffmpeg libatrac9 util)
+
+if(NOT ANDROID)
+	add_subdirectory(tests)
+endif()

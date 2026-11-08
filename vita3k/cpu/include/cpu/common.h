@@ -21,6 +21,7 @@
 #include <mem/util.h> // Address.
 
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
@@ -35,36 +36,30 @@ using CPUStatePtr = std::unique_ptr<CPUState>;
 
 inline constexpr std::size_t MAX_CORE_COUNT = 150;
 
-// How guest code goes on after a checkpoint
-enum class GuestResume : uint8_t {
-    run,
-    // One instruction, for the debugger
-    step,
-    // The function returned, the thread is ending, or it doesn't run on this host thread now
-    leave,
-};
-
-// Why guest code stopped, passed from the CPU to the checkpoint
-struct GuestStop {
-    // The stop came right after a kernel call, or the invocation starts inside one
-    bool after_kernel_call = false;
-    // A finished step or a breakpoint stopped guest code
+// Why guest code stopped
+struct GuestExit {
+    enum class Kind : uint8_t {
+        // The function returned to the return address, value is r0
+        returned,
+        // Guest code called an import, value is its NID
+        import,
+        // A request_stop(), a breakpoint or a finished step
+        stopped,
+    };
+    Kind kind;
+    uint32_t value = 0;
+    // A breakpoint or a step that ran its instruction, so the debugger holds the thread. A stepped
+    // import has it too.
     bool debugger_stop = false;
-    // The function returned to the return address
-    bool returned = false;
 };
 
-// The kernel side of one thread's guest code, which the CPU calls without the thread's lock
-struct GuestBoundary {
-    // Checks the thread at a stop and says how guest code goes on, blocking while something holds it
-    virtual GuestResume checkpoint(GuestStop stop) = 0;
-    // Runs the import with this NID, which guest code called
-    virtual void call_import(uint32_t nid) = 0;
-    // Runs the guest's abort handler for the abort the CPU noted at fault_addr
-    virtual void dispatch_abort(Address fault_addr) = 0;
-
-protected:
-    ~GuestBoundary() = default;
+// An import's result, which the kernel writes to the registers when the call returns to guest code
+struct CallResult {
+    // r0 to r3, of which count are written
+    std::array<uint32_t, 4> regs{};
+    uint8_t count = 0;
+    // A float result, in s0 with its bits in regs[0]
+    bool in_s0 = false;
 };
 
 struct CPUContext {
@@ -72,6 +67,22 @@ struct CPUContext {
     std::array<float, 64> fpu_registers{};
     uint32_t cpsr = 0;
     uint32_t fpscr = 0;
+
+    // The registers as 32-bit words: r0 to r15, cpsr, s0 to s63, then fpscr. A d register is two
+    // words and a q register four.
+    static constexpr uint32_t WORD_CPSR = 16;
+    static constexpr uint32_t WORD_S0 = 17;
+    static constexpr uint32_t WORD_FPSCR = WORD_S0 + 64;
+
+    uint32_t word(uint32_t i) const {
+        if (i < WORD_CPSR)
+            return cpu_registers[i];
+        if (i == WORD_CPSR)
+            return cpsr;
+        if (i < WORD_FPSCR)
+            return std::bit_cast<uint32_t>(fpu_registers[i - WORD_S0]);
+        return fpscr;
+    }
 
     bool thumb() const {
         return cpsr & 0x20;

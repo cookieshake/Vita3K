@@ -2,10 +2,11 @@
 #include <cpu/state.h>
 #include <functional>
 #include <initializer_list>
+#include <cstdint>
 struct ThreadState {
     std::unique_ptr<CPUState> cpu = std::make_unique<CPUState>();
     std::function<void(Address, Address)> callback;
-    void run_callback(Address function, std::initializer_list<Address> args) { callback(function, *args.begin()); }
+    uint32_t call_guest(Address function, std::initializer_list<uint32_t> args) { callback(function, *args.begin()); return 0; }
 };
 using ThreadStatePtr = std::shared_ptr<ThreadState>;
 struct KernelState {
