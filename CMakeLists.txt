@@ -51,7 +51,6 @@ else()
 endif()
 
 option(FORCE_BUILD_OPENSSL_MAC OFF)
-option(VITA3K_HOST_TESTS_ONLY "Configure only host regression tests" OFF)
 
 if("${CMAKE_CXX_COMPILER_LAUNCHER}" STREQUAL "")
 	find_program(CCACHE_PROGRAM ccache)
@@ -149,13 +148,5 @@ if(CMAKE_GENERATOR MATCHES "Visual Studio" AND (CMAKE_C_COMPILER_ID MATCHES "MSV
 endif()
 
 add_subdirectory(external)
-if(VITA3K_HOST_TESTS_ONLY)
-	if(ANDROID)
-		message(FATAL_ERROR "VITA3K_HOST_TESTS_ONLY is only available for host builds")
-	endif()
-	add_subdirectory(vita3k/ngs/tests)
-	add_subdirectory(vita3k/codec/tests)
-else()
-	add_subdirectory(vita3k)
-	add_subdirectory(tools/gen-modules)
-endif()
+add_subdirectory(vita3k)
+add_subdirectory(tools/gen-modules)

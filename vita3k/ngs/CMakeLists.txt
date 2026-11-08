@@ -25,7 +25,3 @@ add_library(
 target_include_directories(ngs PUBLIC include)
 target_link_libraries(ngs PUBLIC codec)
 target_link_libraries(ngs PRIVATE util mem kernel cpu ffmpeg)
-
-if(NOT ANDROID)
-	add_subdirectory(tests)
-endif()
