@@ -51,7 +51,6 @@ else()
 endif()
 
 option(FORCE_BUILD_OPENSSL_MAC OFF)
-option(VITA3K_ING165_TESTS_ONLY "Configure only the ING-165 host regression fixtures" OFF)
 
 if("${CMAKE_CXX_COMPILER_LAUNCHER}" STREQUAL "")
 	find_program(CCACHE_PROGRAM ccache)
@@ -149,10 +148,5 @@ if(CMAKE_GENERATOR MATCHES "Visual Studio" AND (CMAKE_C_COMPILER_ID MATCHES "MSV
 endif()
 
 add_subdirectory(external)
-if(VITA3K_ING165_TESTS_ONLY)
-	add_subdirectory(tools/ing165/tests)
-else()
-	add_subdirectory(vita3k)
-	add_subdirectory(tools/gen-modules)
-	add_subdirectory(tools/ing165/tests)
-endif()
+add_subdirectory(vita3k)
+add_subdirectory(tools/gen-modules)
