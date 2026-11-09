@@ -56,6 +56,10 @@ AacDecoderState::~AacDecoderState() {
     swr_free(&swr);
 }
 
+bool AacDecoderState::is_initialized() const {
+    return context && frame && resampler_format && avcodec_is_open(context);
+}
+
 uint32_t AacDecoderState::get(DecoderQuery query) {
     switch (query) {
     case DecoderQuery::CHANNELS: return output_channels;

@@ -243,6 +243,7 @@ struct AacDecoderState : public DecoderState {
     std::vector<uint8_t> output_pcm;
 
     bool prepare_output();
+    bool is_initialized() const;
     uint32_t get(DecoderQuery query) override;
 
     bool send(const uint8_t *data, uint32_t size) override;
